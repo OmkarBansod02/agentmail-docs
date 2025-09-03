@@ -7,10 +7,10 @@ Build an AI recruiting agent that automatically matches job seekers with relevan
 Before you start, make sure you have the following:
 
 - Python 3.11+
-- An [AgentMail API Key](mailto:contact@agentmail.to)
-- An [OpenAI account](https://openai.com/) and API key
-- An [ngrok account](https://ngrok.com/) and authtoken
-- A CSV file with job listings
+- An [AgentMail API Key](mailto:contact@agentmail.to).
+- An [OpenAI account](https://openai.com/) and API key.
+- An [ngrok account](https://ngrok.com/) and authtoken.
+- A CSV file with job listings.
 
 ## Step 1: Project Setup
 
@@ -44,11 +44,12 @@ First, let's set up your project directory and install the necessary dependencie
 
    # Inbox Configuration
    INBOX_USERNAME=recruiting-agent
-   WEBHOOK_URL=https://your-domain.ngrok-free.app
+   WEBHOOK_DOMAIN=your-ngrok-subdomain.ngrok-free.app
    ```
 
-   - Replace the placeholder values with your actual keys
-   - `INBOX_USERNAME` will be the email address for your agent (e.g., `recruiting-agent@agentmail.to`)
+   - Replace the placeholder values with your actual keys.
+   - `WEBHOOK_DOMAIN` is your custom domain from your ngrok dashboard.
+   - `INBOX_USERNAME` will be the email address for your agent (e.g., `recruiting-agent@agentmail.to`).
 
 5. **Create a `jobs.csv` file** with your job listings. Required columns:
    ```csv
@@ -57,13 +58,11 @@ First, let's set up your project directory and install the necessary dependencie
    Backend Engineer,San Francisco,https://example.com/job2,stripe.com,2025-08-11
    ```
 
-## Step 2: The Agent Code
+## Step 2: The Agent Code (`main.py`)
 
-### Main Application (`main.py`)
+Create a file named `main.py` and add the full code example below. This script contains all the logic for our agent, including the logic to idempotently create the inbox it needs.
 
-Create a file named `main.py`. This contains the core logic for webhook handling and agent initialization:
-
-```python
+```python main.py
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -91,6 +90,7 @@ client_id = "recruiting-agent-1"
 # Initialize services
 listener = ngrok.forward(port, domain=domain, authtoken_from_env=True)
 app = Flask(__name__)
+
 client = AgentMail(api_key=os.getenv("AGENTMAIL_API_KEY"))
 
 # Create inbox and webhook
@@ -98,6 +98,7 @@ inbox_obj = client.inboxes.create(username=username, client_id=client_id)
 inbox_address = f"{username}@agentmail.to"
 
 webhook_url = f"{listener.url()}/webhooks"
+
 client.webhooks.create(
     url=webhook_url,
     inbox_ids=[inbox_obj.inbox_id],
@@ -123,6 +124,86 @@ agent = Agent(
     instructions=instructions,
     tools=AgentMailToolkit(client).get_tools() + [WebSearchTool(), search_jobs, get_job_categories, get_recent_jobs],
 )
+
+@app.route("/", methods=["POST"]) 
+def receive_webhook_root():
+    """Handle webhooks at root endpoint."""
+    Thread(target=process_webhook, args=(request.json,)).start()
+    return Response(status=200)
+
+@app.route("/webhooks", methods=["POST"])
+def receive_webhook():
+    """Handle webhooks at /webhooks endpoint."""
+    Thread(target=process_webhook, args=(request.json,)).start()
+    return Response(status=200)
+
+@app.route("/", methods=["GET"])
+def root_get():
+    """Health check endpoint."""
+    return Response("Recruiting Agent Webhook Endpoint", status=200)
+
+def process_webhook(payload):
+    """Process incoming email webhook and generate agent response."""
+    try:
+        email = payload["message"]
+        thread_id = email.get("thread_id")
+        
+        if not thread_id:
+            return
+        
+        # Fetch full thread context for conversation continuity
+        thread_context = []
+        try:
+            thread = client.inboxes.threads.get(inbox_id=inbox_obj.inbox_id, thread_id=thread_id)
+            
+            # Build conversation context from thread history
+            for msg in thread.messages:
+                message_content = msg.text or msg.html or "No content"
+                
+                if hasattr(msg, 'from_') and msg.from_ and not msg.from_.endswith('@agentmail.to'):
+                    thread_context.append({"role": "user", "content": message_content})
+                else:
+                    thread_context.append({"role": "assistant", "content": message_content})
+            
+        except Exception as e:
+            thread_context = []
+        
+        # Construct prompt with email details
+        prompt = f"""
+From: {email["from"]}
+Subject: {email["subject"]}
+Body:\n{email["text"]}
+
+IMPORTANT FOR TOOL CALLS:
+- THREAD_ID: {email.get("thread_id", "N/A")}
+- MESSAGE_ID: {email.get("message_id", "N/A")}
+
+FORMATTING REQUIREMENTS:
+- Use HTML formatting in your response (this will be sent as an HTML email)
+- For bold text: use <strong>text</strong> instead of **text**
+- For job listings: use clean HTML structure with <p>, <strong>, <em> tags
+- For links: use <a href="url">text</a> format
+- No markdown syntax (**, *, etc.) - only HTML tags
+"""
+        
+        # Run agent with full conversation context
+        response = asyncio.run(Runner.run(agent, thread_context + [{"role": "user", "content": prompt}]))
+        
+        # Send reply
+        client.inboxes.messages.reply(
+            inbox_id=inbox_obj.inbox_id,
+            message_id=email["message_id"],
+            html=response.final_output,
+        )
+        
+    except Exception as e:
+        print(f"Error processing webhook: {e}")
+
+if __name__ == "__main__":
+    print(f"Inbox: {inbox_address}\n")
+    print(f"Starting server on port {port}")
+    
+    app.run(host="0.0.0.0", port=port)
 ```
 
 ### Job Search Tools (`job_search_tool.py`)
@@ -209,66 +290,54 @@ def get_recent_jobs(max_results: int = 10) -> List[Dict[str, Any]]:
     return results
 ```
 
-### System Prompt (`system_prompt.txt`)
+### Understanding the Code
 
-Create a `system_prompt.txt` file to define your agent's behavior:
+<AccordionGroup>
+  <Accordion title="Idempotency with `client_id`">
+    Notice that the script handles its own setup. Before the agent starts, the code calls `client.inboxes.create` with a `client_id` parameter. This makes the operation **idempotent**.
 
-```txt
-You are an AI recruiting agent and career advisor. Your name is RecruitingAgent. Your email address is {inbox}.
+    The first time you run the script, it creates the inbox. Every subsequent time, the AgentMail API will recognize the `client_id`, see that the inbox already exists, and simply return the existing inbox's data instead of creating a duplicate. This makes your script robust and safe to run multiple times. The same principle is used when creating the webhook.
+  </Accordion>
+  <Accordion title="Agent Instructions and Job Search Tools">
+    The agent uses a system prompt loaded from `system_prompt.txt` that defines its personality and operational logic. The agent has access to three custom job search tools:
+    
+    - `search_jobs()`: Primary search function that filters jobs by keywords and location using pandas
+    - `get_recent_jobs()`: Returns recent job postings when no specific criteria provided  
+    - `get_job_categories()`: Lists available job types from the database
+    
+    These tools work with a CSV database containing job listings with columns for title, location, company domain, and posting date.
+  </Accordion>
+  <Accordion title="Webhook Server (`Flask` and `ngrok`)">
+    - `app = Flask(__name__)` creates our web server.
+    - `@app.route("/webhooks", methods=["POST"])` defines the specific URL that will listen for `POST` requests from AgentMail.
+    - `listener = ngrok.forward(...)` tells `ngrok` to create a public URL (using your `WEBHOOK_DOMAIN`) and securely forward all traffic to our local Flask server on port `8080`.
+  </Accordion>
+  <Accordion title="Webhook Processing (`process_webhook`)">
+    When a request hits our `/webhooks` endpoint, the `receive_webhook` function immediately starts the `process_webhook` function in a new thread. This is a crucial best practice: it allows us to return a `200 OK` status to AgentMail instantly while the heavy lifting happens in the background.
 
-Primary objective:
-- Help candidates find relevant job opportunities from your comprehensive job database
-- Provide personalized career guidance and job matching based on their background
-- Use the search_jobs and get_job_categories tools to find suitable positions
-
-Core workflow:
-- Greet candidates warmly and ask about their job search goals, preferred locations, and experience level
-- Use search_jobs tool to find relevant positions based on their skills, experience, and preferences
-- Present job matches in an organized, easy-to-read format with key details (title, company, location)
-- Provide specific advice on how to tailor their application for each role
-
-Style and constraints:
-- Write in clean HTML format for proper email formatting
-- Use <strong> for bold text, <ul><li> for bullet points, <p> for paragraphs
-- Keep responses focused and actionable
-```
-
-## Understanding the Code
-
-### Webhook Processing Flow
-
-1. **Incoming Email**: AgentMail receives an email at your agent's inbox
-2. **Webhook Trigger**: Your Flask server receives the webhook payload
-3. **Thread Context**: The system fetches conversation history for context
-4. **Prompt Construction**: Email content is formatted with instructions
-5. **Agent Processing**: The agent analyzes the email and searches jobs
-6. **Response Generation**: Agent creates an HTML-formatted reply
-7. **Email Reply**: Response is sent back to the candidate
-
-### Key Components
-
-- **`process_webhook()`**: Handles incoming emails and manages conversation context
-- **`search_jobs()`**: Filters jobs by keywords and location using pandas
-- **`get_recent_jobs()`**: Returns recent job postings when no specific criteria provided
-- **Agent Tools**: Combines AgentMail toolkit with job search functions
+    Inside `process_webhook`, the function:
+    1. Parses the JSON payload to extract email content
+    2. Fetches conversation history for context continuity  
+    3. Constructs a prompt with email details and formatting requirements
+    4. Runs the agent with job search tools to find relevant opportunities
+    5. Uses `client.inboxes.messages.reply()` to send the agent's HTML output as a reply
+  </Accordion>
+</AccordionGroup>
 
 ## Step 3: Run the Agent
 
-1. **Start the server:**
-   ```bash
-   python main.py
-   ```
+Now, let's bring your agent to life. The script is now fully self-contained. When you run it, it will automatically:
+1. Create the agent's inbox.
+2. Start an `ngrok` tunnel to get a public URL.
+3. Use that URL to create the AgentMail webhook.
+4. Start the web server to listen for events.
+5. Load the job database from your CSV file.
 
-2. **Expose your local server** (if running locally):
-   ```bash
-   ngrok http 8080
-   ```
-   Update the `WEBHOOK_URL` in your `.env` file with the ngrok URL.
-
-3. **Monitor the logs** to see:
-   - Job database loading
-   - Webhook registration
-   - Incoming email processing
+Open your terminal in the project directory and run the command:
+```bash
+python main.py
+```
+You should see a series of logs confirming that all setup steps have been completed. Keep this terminal window running.
 
 ## Step 4: Test Your Agent
 
